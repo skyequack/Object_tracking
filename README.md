@@ -25,8 +25,8 @@ A robust real-time object tracking system built with OpenCV and YOLOv8 that can 
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/enhanced-object-tracker.git
-   cd enhanced-object-tracker
+   git clone https://github.com/skyequack/object-tracking.git
+   cd object-tracking
    ```
 
 2. Install dependencies:
@@ -45,7 +45,7 @@ A robust real-time object tracking system built with OpenCV and YOLOv8 that can 
 ### Basic Usage
 
 ```bash
-python enhanced_object_tracker.py
+python3 multi_object_tracker.py
 ```
 
 This will start the tracker using your webcam and the default configuration.
@@ -53,7 +53,7 @@ This will start the tracker using your webcam and the default configuration.
 ### Advanced Options
 
 ```bash
-python enhanced_object_tracker.py --input 0 --model yolov8n.pt --tracker CSRT --classes person,car --confidence 0.5
+python3 multi_object_tracker.py --input 0 --model yolov8n.pt --tracker CSRT --classes person,car --confidence 0.5
 ```
 
 ### Command-Line Arguments
