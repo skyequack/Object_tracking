@@ -34,12 +34,6 @@ A robust real-time object tracking system built with OpenCV and YOLOv8 that can 
    pip install -r requirements.txt
    ```
 
-3. Download a YOLOv8 model:
-   ```bash
-   # The code will automatically download YOLOv8n if not present
-   # Alternatively, you can download models manually from Ultralytics
-   ```
-
 ## Usage
 
 ### Basic Usage
