@@ -16,286 +16,260 @@ class Config:
         self.video_save_path = os.path.join(self.output_dir, 'tracked_output.mp4')
         self.detection_classes = None  # None means track all detected objects
         self.confidence_threshold = 0.5
-        self.tracking_failure_threshold = 15  # Frames before considering tracking lost
+        self.tracking_failure_threshold = 10  # Frames before considering tracking lost
         self.input_source = 0  # 0 for webcam, or file path for video
-        self.reinitialize_interval = 300  # Frames between tracker reinitializations (reduced frequency)
-        self.track_max_objects = 10  # Maximum number of objects to track simultaneously
-        self.id_matching_enabled = True  # Enable ID matching to maintain consistent IDs
+        self.track_max_objects = 5  # Maximum number of objects to track simultaneously
+        self.trajectory_length = 50  # Maximum number of points in trajectory
+        self.interactive_mode = True  # Enable interactive object selection
         
 # === Tracker Factory ===
 def create_tracker_by_name(tracker_type):
     """Create a tracker instance based on name"""
-    if hasattr(cv2, 'legacy'):
-        legacy = cv2.legacy
-    else:
-        legacy = cv2
+    try:
+        # Try legacy trackers first (newer OpenCV versions)
+        if hasattr(cv2, 'legacy'):
+            if tracker_type == 'CSRT':
+                return cv2.legacy.TrackerCSRT_create()
+            elif tracker_type == 'KCF':
+                return cv2.legacy.TrackerKCF_create()
+            elif tracker_type == 'MIL':
+                return cv2.legacy.TrackerMIL_create()
+            elif tracker_type == 'MOSSE':
+                return cv2.legacy.TrackerMOSSE_create()
         
-    if tracker_type == 'CSRT':
-        return legacy.TrackerCSRT_create()
-    elif tracker_type == 'KCF':
-        return legacy.TrackerKCF_create()
-    elif tracker_type == 'MIL':
-        return legacy.TrackerMIL_create()
-    elif tracker_type == 'MOSSE':
-        return legacy.TrackerMOSSE_create()
-    else:
-        raise ValueError(f"Unsupported tracker type: {tracker_type}")
+        # Try direct cv2 trackers (older OpenCV versions)
+        if tracker_type == 'CSRT':
+            return cv2.TrackerCSRT_create()
+        elif tracker_type == 'KCF':
+            return cv2.TrackerKCF_create()
+        elif tracker_type == 'MIL':
+            return cv2.TrackerMIL_create()
+        elif tracker_type == 'MOSSE':
+            return cv2.TrackerMOSSE_create()
+            
+    except AttributeError:
+        print(f"Warning: {tracker_type} tracker not available in this OpenCV version")
+        print("Available trackers might be limited. Please install opencv-contrib-python")
+        
+        # Fallback to any available tracker
+        try:
+            if hasattr(cv2, 'legacy'):
+                return cv2.legacy.TrackerCSRT_create()
+            else:
+                return cv2.TrackerCSRT_create()
+        except:
+            pass
+    
+    raise ValueError(f"No suitable tracker found. Please install opencv-contrib-python")
 
-def create_multi_tracker():
-    """Create a multi-tracker instance compatible with the installed OpenCV version"""
-    if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'MultiTracker_create'):
-        return cv2.legacy.MultiTracker_create()
-    elif hasattr(cv2, 'MultiTracker_create'):
-        return cv2.MultiTracker_create()
-    else:
-        raise ImportError("MultiTracker not found. Install OpenCV-contrib with `pip install opencv-contrib-python`.")
+class SingleObjectTracker:
+    """Tracks a single object with its own tracker instance"""
+    def __init__(self, tracker_type, bbox, frame, obj_id, class_name, confidence):
+        self.tracker = create_tracker_by_name(tracker_type)
+        self.obj_id = obj_id
+        self.class_name = class_name
+        self.confidence = confidence
+        self.trajectory = []
+        self.tracking_failures = 0
+        self.is_lost = False
+        self.color = tuple(map(int, np.random.randint(50, 255, 3)))
+        
+        # Initialize tracker
+        success = self.tracker.init(frame, bbox)
+        if not success:
+            raise Exception(f"Failed to initialize tracker for object {obj_id}")
+        
+        # Add initial position to trajectory
+        x, y, w, h = bbox
+        center = (int(x + w/2), int(y + h/2))
+        self.trajectory.append(center)
+        
+    def update(self, frame, failure_threshold):
+        """Update tracker and return success status and bounding box"""
+        success, bbox = self.tracker.update(frame)
+        
+        if success:
+            # Validate bounding box
+            x, y, w, h = bbox
+            if x < 0 or y < 0 or w < 10 or h < 10 or x > frame.shape[1] or y > frame.shape[0]:
+                success = False
+                
+        if success:
+            self.tracking_failures = 0
+            self.is_lost = False
+            
+            # Update trajectory
+            x, y, w, h = bbox
+            center = (int(x + w/2), int(y + h/2))
+            self.trajectory.append(center)
+            
+            # Limit trajectory length
+            if len(self.trajectory) > 50:
+                self.trajectory.pop(0)
+                
+            return True, bbox
+        else:
+            self.tracking_failures += 1
+            if self.tracking_failures >= failure_threshold:
+                self.is_lost = True
+            return False, None
+    
+    def draw(self, frame):
+        """Draw bounding box and trajectory on frame"""
+        if self.is_lost:
+            return
+            
+        # Draw trajectory
+        if len(self.trajectory) > 1:
+            for i in range(1, len(self.trajectory)):
+                thickness = max(1, int(3 * (i / len(self.trajectory))))
+                cv2.line(frame, self.trajectory[i-1], self.trajectory[i], self.color, thickness)
+        
+        # Draw current position if we have a recent position
+        if self.trajectory:
+            current_pos = self.trajectory[-1]
+            cv2.circle(frame, current_pos, 5, self.color, -1)
 
-class ObjectTracker:
+class MultiObjectTracker:
     def __init__(self, config):
         self.config = config
-        self.model = YOLO(config.model_path)
+        
+        # Check if YOLO model file exists
+        if not os.path.exists(config.model_path):
+            print(f"Warning: Model file {config.model_path} not found.")
+            print("YOLO will attempt to download the model automatically.")
+        
+        try:
+            self.model = YOLO(config.model_path)
+            print(f"✓ Loaded YOLO model: {config.model_path}")
+        except Exception as e:
+            print(f"Error loading YOLO model: {e}")
+            print("Please ensure ultralytics is installed: pip install ultralytics")
+            raise
+            
         os.makedirs(config.output_dir, exist_ok=True)
-        self.object_colors = {}  # To assign consistent colors to objects
+        
+        self.trackers = {}  # Dictionary of active trackers
+        self.next_id = 1
         self.frame_count = 0
-        self.trajectories = defaultdict(list)
-        self.tracking_failures = defaultdict(int)
-        self.class_labels = {}  # To store class labels for tracked objects
-        self.object_ids = {}    # To assign unique IDs to objects
-        self.next_id = 1        # Counter for assigning unique IDs
-        self.object_confidences = {}  # Store confidence scores for objects
-        self.previous_detections = []  # Store previous frame detections for ID matching
+        self.mouse_callback_active = False
+        self.selected_objects = []  # For interactive selection
         
-    def get_object_color(self, obj_id):
-        """Generate a consistent color for each object ID"""
-        if obj_id not in self.object_colors:
-            # Generate a random but visually distinct color
-            self.object_colors[obj_id] = tuple(map(int, np.random.randint(0, 255, 3)))
-        return self.object_colors[obj_id]
-    
-    def calculate_iou(self, box1, box2):
-        """Calculate Intersection over Union (IoU) between two bounding boxes"""
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-        
-        # Calculate intersection area
-        xi1 = max(x1, x2)
-        yi1 = max(y1, y2)
-        xi2 = min(x1 + w1, x2 + w2)
-        yi2 = min(y1 + h1, y2 + h2)
-        
-        if xi2 <= xi1 or yi2 <= yi1:
-            return 0.0
-        
-        intersection_area = (xi2 - xi1) * (yi2 - yi1)
-        
-        # Calculate union area
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - intersection_area
-        
-        return intersection_area / union_area if union_area > 0 else 0.0
-    
-    def match_detections_to_trackers(self, current_detections, current_confidences, current_classes):
-        """Match current detections to existing tracker IDs based on IoU similarity"""
-        if not self.previous_detections:
-            # First detection, assign new IDs
-            matched_ids = []
-            for i, (bbox, conf, cls) in enumerate(zip(current_detections, current_confidences, current_classes)):
-                obj_id = self.next_id
-                self.next_id += 1
-                self.class_labels[obj_id] = cls
-                self.object_confidences[obj_id] = conf
-                matched_ids.append(obj_id)
+    def mouse_callback(self, event, x, y, flags, param):
+        """Handle mouse clicks for object selection"""
+        if event == cv2.EVENT_LBUTTONDOWN and self.mouse_callback_active:
+            frame, detections = param
             
-            self.previous_detections = current_detections.copy()
-            return matched_ids
+            # Find clicked detection
+            for i, (bbox, class_name, confidence) in enumerate(detections):
+                bx, by, bw, bh = bbox
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    self.selected_objects.append((bbox, class_name, confidence))
+                    print(f"Selected {class_name} for tracking (confidence: {confidence:.2f})")
+                    break
     
-    def run_detection(self, frame):
-        """Run YOLO detection on a frame and filter by confidence and class"""
+    def detect_objects(self, frame):
+        """Run YOLO detection and return filtered results"""
         results = self.model(frame)[0]
         
-        bboxes = []
-        class_names = []
-        confidences = []
-        
+        detections = []
         for box in results.boxes:
             conf = float(box.conf[0])
             cls_id = int(box.cls[0])
             cls_name = self.model.names[cls_id]
             
-            # Filter by confidence and class if specified
             if conf >= self.config.confidence_threshold and (
                 self.config.detection_classes is None or 
                 cls_name in self.config.detection_classes
             ):
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                bboxes.append((x1, y1, x2 - x1, y2 - y1))  # Convert to (x, y, w, h)
-                class_names.append(cls_name)
-                confidences.append(conf)
+                bbox = (x1, y1, x2 - x1, y2 - y1)
+                detections.append((bbox, cls_name, conf))
         
-        # Sort by confidence and take the top N objects
-        if len(bboxes) > self.config.track_max_objects:
-            indices = np.argsort(confidences)[::-1][:self.config.track_max_objects]
-            bboxes = [bboxes[i] for i in indices]
-            class_names = [class_names[i] for i in indices]
-            confidences = [confidences[i] for i in indices]
-            
-        return bboxes, class_names, confidences
-        
-        # Calculate IoU matrix between current and previous detections
-        iou_matrix = np.zeros((len(current_detections), len(self.previous_detections)))
-        for i, curr_det in enumerate(current_detections):
-            for j, prev_det in enumerate(self.previous_detections):
-                iou_matrix[i, j] = self.calculate_iou(curr_det, prev_det)
-        
-        # Find best matches using Hungarian algorithm (simplified greedy approach)
-        matched_ids = []
-        used_prev_indices = set()
-        
-        # Sort current detections by best IoU match
-        for i in range(len(current_detections)):
-            best_match_idx = -1
-            best_iou = 0.3  # Minimum IoU threshold for matching
-            
-            for j in range(len(self.previous_detections)):
-                if j not in used_prev_indices and iou_matrix[i, j] > best_iou:
-                    best_iou = iou_matrix[i, j]
-                    best_match_idx = j
-            
-            if best_match_idx != -1:
-                # Found a match, reuse the ID
-                used_prev_indices.add(best_match_idx)
-                # Find the ID that was used for this previous detection
-                prev_id = None
-                for obj_id, prev_det in self.previous_detections_with_ids:
-                    if np.array_equal(prev_det, self.previous_detections[best_match_idx]):
-                        prev_id = obj_id
-                        break
-                
-                if prev_id:
-                    matched_ids.append(prev_id)
-                    self.object_confidences[prev_id] = current_confidences[i]
-                    self.class_labels[prev_id] = current_classes[i]
-                else:
-                    # Fallback: create new ID
-                    obj_id = self.next_id
-                    self.next_id += 1
-                    self.class_labels[obj_id] = current_classes[i]
-                    self.object_confidences[obj_id] = current_confidences[i]
-                    matched_ids.append(obj_id)
-            else:
-                # No match found, create new ID
-                obj_id = self.next_id
-                self.next_id += 1
-                self.class_labels[obj_id] = current_classes[i]
-                self.object_confidences[obj_id] = current_confidences[i]
-                matched_ids.append(obj_id)
-        
-        # Store current detections for next frame
-        self.previous_detections = current_detections.copy()
-        self.previous_detections_with_ids = list(zip(matched_ids, current_detections))
-        
-        return matched_ids
-        """Run YOLO detection on a frame and filter by confidence and class"""
-        results = self.model(frame)[0]
-        
-        bboxes = []
-        class_names = []
-        confidences = []
-        
-        for box in results.boxes:
-            conf = float(box.conf[0])
-            cls_id = int(box.cls[0])
-            cls_name = self.model.names[cls_id]
-            
-            # Filter by confidence and class if specified
-            if conf >= self.config.confidence_threshold and (
-                self.config.detection_classes is None or 
-                cls_name in self.config.detection_classes
-            ):
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                bboxes.append((x1, y1, x2 - x1, y2 - y1))  # Convert to (x, y, w, h)
-                class_names.append(cls_name)
-                confidences.append(conf)
-        
-        # Sort by confidence and take the top N objects
-        if len(bboxes) > self.config.track_max_objects:
-            indices = np.argsort(confidences)[::-1][:self.config.track_max_objects]
-            bboxes = [bboxes[i] for i in indices]
-            class_names = [class_names[i] for i in indices]
-            confidences = [confidences[i] for i in indices]
-            
-        return bboxes, class_names, confidences
+        # Sort by confidence and limit number
+        detections.sort(key=lambda x: x[2], reverse=True)
+        return detections[:self.config.track_max_objects]
     
-    def draw_tracking_info(self, frame, boxes, object_ids):
-        """Draw bounding boxes, trajectories, and labels on frame"""
-        for i, (box, obj_id) in enumerate(zip(boxes, object_ids)):
-            if obj_id in self.tracking_failures and self.tracking_failures[obj_id] > self.config.tracking_failure_threshold:
-                continue  # Skip drawing lost objects
-                
-            x, y, w, h = [int(v) for v in box]
-            center = (x + w // 2, y + h // 2)
-            color = self.get_object_color(obj_id)
+    def draw_detections(self, frame, detections):
+        """Draw detection boxes for selection"""
+        for bbox, class_name, confidence in detections:
+            x, y, w, h = bbox
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
-            # Add current position to trajectory
-            self.trajectories[obj_id].append(center)
-            
-            # Limit trajectory length to avoid clutter
-            max_traj_length = 60  # ~2 seconds at 30fps
-            if len(self.trajectories[obj_id]) > max_traj_length:
-                self.trajectories[obj_id] = self.trajectories[obj_id][-max_traj_length:]
-            
-            # Draw box with thickness based on tracking quality
-            thickness = 2
-            if obj_id in self.tracking_failures:
-                quality = 1.0 - (self.tracking_failures[obj_id] / self.config.tracking_failure_threshold)
-                thickness = max(1, int(3 * quality))
-                
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-            
-            # Draw trajectory line
-            if len(self.trajectories[obj_id]) > 1:
-                for j in range(1, len(self.trajectories[obj_id])):
-                    cv2.line(frame, self.trajectories[obj_id][j-1], 
-                             self.trajectories[obj_id][j], color, 2)
-            
-            # Add label with ID, class, and confidence
-            confidence = self.object_confidences.get(obj_id, 0.0)
-            label = f"ID:{obj_id} - {self.class_labels.get(obj_id, 'Unknown')} ({confidence:.2f})"
-            
-            # Calculate text size for background
-            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            
-            # Draw background rectangle for text
-            cv2.rectangle(frame, (x, y - text_height - 10), (x + text_width, y), color, -1)
-            
-            # Draw text in contrasting color
-            text_color = (255, 255, 255) if sum(color) < 400 else (0, 0, 0)
-            cv2.putText(frame, label, (x, y - 5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+            label = f"{class_name} ({confidence:.2f})"
+            cv2.putText(frame, label, (x, y - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Add frame information
-        cv2.putText(frame, f"Frame: {self.frame_count} | Objects: {len(boxes)}", 
+        # Instructions
+        cv2.putText(frame, "Click on objects to track, press SPACE to start tracking", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, f"Selected: {len(self.selected_objects)} objects", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    
+    def initialize_trackers(self, frame):
+        """Initialize trackers for selected objects"""
+        print("\n=== Initializing Trackers ===")
+        for bbox, class_name, confidence in self.selected_objects:
+            try:
+                tracker = SingleObjectTracker(
+                    self.config.tracker_type, bbox, frame, 
+                    self.next_id, class_name, confidence
+                )
+                self.trackers[self.next_id] = tracker
+                print(f"✓ Started tracking {class_name} (ID: {self.next_id})")
+                self.next_id += 1
+            except Exception as e:
+                print(f"✗ Failed to initialize tracker for {class_name}: {e}")
+        
+        self.selected_objects.clear()
+        print(f"Total active trackers: {len(self.trackers)}")
+    
+    def update_trackers(self, frame):
+        """Update all active trackers"""
+        lost_trackers = []
+        
+        for obj_id, tracker in self.trackers.items():
+            success, bbox = tracker.update(frame, self.config.tracking_failure_threshold)
+            
+            if tracker.is_lost:
+                lost_trackers.append(obj_id)
+                print(f"⚠️  TRACKING LOST: {tracker.class_name} (ID: {obj_id})")
+        
+        # Remove lost trackers
+        for obj_id in lost_trackers:
+            del self.trackers[obj_id]
+        
+        return len(lost_trackers) > 0
+    
+    def draw_tracking_info(self, frame):
+        """Draw all tracking information on frame"""
+        # Draw individual tracker info
+        for tracker in self.trackers.values():
+            tracker.draw(frame)
+        
+        # Draw status information
+        active_count = len(self.trackers)
+        cv2.putText(frame, f"Active Trackers: {active_count}", 
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Frame: {self.frame_count}", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, "Press 'r' to redetect, 'q' to quit", 
+                   (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        return frame
-    
-    def check_tracking_quality(self, boxes):
-        """Check if tracking quality is acceptable"""
-        tracking_quality = []
-        for i, box in enumerate(boxes):
-            x, y, w, h = box
-            
-            # Check if box is outside the frame or too small
-            if x < 0 or y < 0 or w < 10 or h < 10:
-                tracking_quality.append(False)
-            else:
-                tracking_quality.append(True)
-                
-        return tracking_quality
+        # Alert if no active trackers
+        if active_count == 0:
+            cv2.putText(frame, "NO ACTIVE TRACKERS - Press 'r' to redetect", 
+                       (frame.shape[1]//2 - 200, frame.shape[0]//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     
     def run(self):
         """Main tracking loop"""
+        print("=== Enhanced Multi-Object Tracker ===")
+        print("Instructions:")
+        print("- 'r': Re-detect and select objects")
+        print("- 'q': Quit")
+        print("- During selection: Click objects, then press SPACE to start tracking")
+        
         # Initialize video capture
         cap = cv2.VideoCapture(self.config.input_source)
         if not cap.isOpened():
@@ -305,130 +279,127 @@ class ObjectTracker:
         # Get video properties
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps < 1:
-            fps = 30  # Default if unable to determine
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
         
-        # Initialize video writer if needed
+        print(f"Video properties: {width}x{height} @ {fps} FPS")
+        
+        # Initialize video writer
         video_writer = None
         if self.config.output_video:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            video_writer = cv2.VideoWriter(
-                self.config.video_save_path,
-                fourcc, 
-                fps,
-                (width, height)
-            )
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(self.config.video_save_path, fourcc, fps, (width, height))
+                print(f"✓ Video output enabled: {self.config.video_save_path}")
+            except Exception as e:
+                print(f"Warning: Could not initialize video writer: {e}")
+                self.config.output_video = False
         
-        # Initialize trackers
-        multi_tracker = create_multi_tracker()
-        tracked_object_ids = []
+        # Set up window
+        window_name = "Enhanced Multi-Object Tracker"
+        cv2.namedWindow(window_name)
         
-        # Add detection matching initialization
-        self.previous_detections_with_ids = []
+        # Initial detection phase
+        selection_mode = True
         
-        while True:
-            start_time = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                print("End of video stream.")
-                break
-            
-            self.frame_count += 1
-            
-            # Determine if we need to reinitialize trackers
-            # Only reinitialize if no objects are being tracked or tracking quality is very poor
-            reinitialize = (not tracked_object_ids) or (
-                self.frame_count % self.config.reinitialize_interval == 0 and 
-                len([1 for obj_id in tracked_object_ids if self.tracking_failures.get(obj_id, 0) > self.config.tracking_failure_threshold]) > len(tracked_object_ids) * 0.7
-            )
-            
-            if reinitialize:
-                print(f"Reinitializing trackers at frame {self.frame_count}")
-                # Run object detection
-                bboxes, class_names, confidences = self.run_detection(frame)
+        try:
+            while True:
+                start_time = time.time()
+                ret, frame = cap.read()
+                if not ret:
+                    print("End of video stream.")
+                    break
                 
-                if not bboxes:
-                    print("No objects detected.")
-                    # Continue showing frames but no tracking
-                    cv2.putText(frame, "No objects detected", (width//2 - 100, height//2), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                else:
-                    # Reset tracker and create new one with ID matching
-                    multi_tracker = create_multi_tracker()
-                    
-                    # Use ID matching to maintain consistent IDs
-                    matched_ids = self.match_detections_to_trackers(bboxes, confidences, class_names)
-                    tracked_object_ids = []
-                    
-                    # Initialize trackers for each detected object with matched IDs
-                    for i, (bbox, obj_id) in enumerate(zip(bboxes, matched_ids)):
-                        tracker = create_tracker_by_name(self.config.tracker_type)
+                self.frame_count += 1
+                
+                if selection_mode:
+                    # Detection and selection phase
+                    try:
+                        detections = self.detect_objects(frame)
+                        self.draw_detections(frame, detections)
                         
-                        # Add to multi-tracker
-                        success = multi_tracker.add(tracker, frame, bbox)
-                        if success:
-                            tracked_object_ids.append(obj_id)
-                            print(f"Started tracking {self.class_labels[obj_id]} (ID: {obj_id}) with confidence {self.object_confidences[obj_id]:.2f}")
-                        else:
-                            print(f"Failed to initialize tracker for {self.class_labels[obj_id]}")
-            
-            # Update trackers
-            success, boxes = multi_tracker.update(frame)
-            
-            # Check tracking quality
-            if success:
-                tracking_quality = self.check_tracking_quality(boxes)
+                        # Set up mouse callback for selection
+                        self.mouse_callback_active = True
+                        cv2.setMouseCallback(window_name, self.mouse_callback, (frame, detections))
+                        
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord(' ') and self.selected_objects:
+                            # Start tracking selected objects
+                            self.initialize_trackers(frame)
+                            selection_mode = False
+                            self.mouse_callback_active = False
+                        elif key == ord('q'):
+                            break
+                    except Exception as e:
+                        print(f"Error during detection: {e}")
+                        cv2.putText(frame, f"Detection Error: {str(e)[:50]}", 
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                else:
+                    # Tracking phase
+                    try:
+                        tracking_lost = self.update_trackers(frame)
+                        self.draw_tracking_info(frame)
+                        
+                        # Handle user input
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('r'):
+                            # Re-enter selection mode
+                            selection_mode = True
+                            self.trackers.clear()
+                            print("\n=== Re-detection Mode ===")
+                        elif key == ord('q'):
+                            break
+                    except Exception as e:
+                        print(f"Error during tracking: {e}")
+                        cv2.putText(frame, f"Tracking Error: {str(e)[:50]}", 
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 
-                # Update tracking failures counter
-                for i, (quality, obj_id) in enumerate(zip(tracking_quality, tracked_object_ids)):
-                    if not quality:
-                        self.tracking_failures[obj_id] += 1
-                    else:
-                        # Reset failure counter if tracking is good
-                        self.tracking_failures[obj_id] = max(0, self.tracking_failures[obj_id] - 1)
-            
-            # Draw tracking information
-            output_frame = self.draw_tracking_info(frame.copy(), boxes, tracked_object_ids)
-            
-            # Calculate and display FPS
-            processing_time = time.time() - start_time
-            fps_text = f"FPS: {1.0/processing_time:.1f}"
-            cv2.putText(output_frame, fps_text, (10, height - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            # Display the frame
-            cv2.imshow("Enhanced Object Tracker", output_frame)
-            
-            # Write frame to video if enabled
+                # Calculate and display FPS
+                processing_time = time.time() - start_time
+                if processing_time > 0:
+                    fps_text = f"FPS: {1.0/processing_time:.1f}"
+                    cv2.putText(frame, fps_text, (width - 120, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Show frame
+                cv2.imshow(window_name, frame)
+                
+                # Save frame if video output is enabled
+                if video_writer is not None:
+                    video_writer.write(frame)
+                    
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+        finally:
+            # Cleanup
+            cap.release()
             if video_writer is not None:
-                video_writer.write(output_frame)
+                video_writer.release()
+                print(f"Video saved to: {self.config.video_save_path}")
+            cv2.destroyAllWindows()
             
-            # Check for user exit
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("User interrupted.")
-                break
-        
-        # Clean up
-        cap.release()
-        if video_writer is not None:
-            video_writer.release()
-        cv2.destroyAllWindows()
-        
-        print(f"Tracking session completed. Output saved to {self.config.video_save_path if self.config.output_video else 'not saved'}")
+            print("Tracking session completed.")
 
 def main():
     """Parse arguments and run the tracker"""
-    parser = argparse.ArgumentParser(description="Enhanced Object Tracking System")
+    parser = argparse.ArgumentParser(description="Enhanced Multi-Object Tracking System")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="Path to YOLO model")
-    parser.add_argument("--tracker", type=str, default="CSRT", choices=["CSRT", "KCF", "MIL", "MOSSE"], 
+    parser.add_argument("--tracker", type=str, default="CSRT", 
+                        choices=["CSRT", "KCF", "MIL", "MOSSE"], 
                         help="Tracker algorithm to use")
-    parser.add_argument("--input", type=str, default="0", help="Input source (0 for webcam, or video file path)")
-    parser.add_argument("--output", type=str, default="./outputs/tracked_output.mp4", help="Output video path")
-    parser.add_argument("--confidence", type=float, default=0.5, help="Detection confidence threshold")
+    parser.add_argument("--input", type=str, default="0", 
+                        help="Input source (0 for webcam, or video file path)")
+    parser.add_argument("--output", type=str, default="./outputs/tracked_output.mp4", 
+                        help="Output video path")
+    parser.add_argument("--confidence", type=float, default=0.5, 
+                        help="Detection confidence threshold")
     parser.add_argument("--classes", type=str, default=None, 
                         help="Comma-separated list of classes to track (e.g., 'person,car,dog')")
-    parser.add_argument("--max-objects", type=int, default=10, help="Maximum number of objects to track")
+    parser.add_argument("--max-objects", type=int, default=5, 
+                        help="Maximum number of objects to track")
+    parser.add_argument("--no-output", action="store_true", 
+                        help="Disable video output saving")
     
     args = parser.parse_args()
     
@@ -440,12 +411,13 @@ def main():
     config.output_dir = os.path.dirname(args.output)
     config.confidence_threshold = args.confidence
     config.track_max_objects = args.max_objects
+    config.output_video = not args.no_output
     
     # Handle input source
     try:
-        config.input_source = int(args.input)  # Try as camera index
+        config.input_source = int(args.input)
     except ValueError:
-        config.input_source = args.input  # Use as file path
+        config.input_source = args.input
     
     # Handle classes
     if args.classes:
@@ -453,7 +425,7 @@ def main():
         print(f"Tracking classes: {config.detection_classes}")
     
     # Create and run tracker
-    tracker = ObjectTracker(config)
+    tracker = MultiObjectTracker(config)
     tracker.run()
 
 if __name__ == '__main__':
